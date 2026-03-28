@@ -17,7 +17,7 @@ This tool abandons simple geometric tracing in favor of graph theory and heurist
 * **River Tapering & Generalization:** Uses Douglas-Peucker and PAEK for cartographic smoothing. The polygon width is dynamically generated using $W = k \cdot \sqrt{Shreve}$ via a multi-threaded Pairwise Buffer.
 
 ## Usage
-1. Download `Sojka_Nastroje.atbx` and `OSMgen.py`.
+1. Download `OSMgen.atbx` and `OSMgen.py`.
 2. In ArcGIS Pro, right-click **Toolboxes** -> **Add Toolbox** and select the `.atbx` file.
 3. Open the tool, input your raw OSM lines, specify the target scale (e.g., 100000), target river name, and the output spatial reference. 
 
@@ -41,10 +41,10 @@ Skript opouští jednoduché geometrické trasování a spoléhá na teorii graf
 * **Generalizace a tvorba koryta:** Skript síť vyhladí (Douglas-Peucker + PAEK). Šířka finálního polygonu je počítána dynamicky vztahem $W = k \cdot \sqrt{Shreve}$ za pomoci rychlého nástroje Pairwise Buffer.
 
 ## Použití
-1. Stáhněte si `Sojka_Nastroje.atbx` a `OSMgen.py`.
+1. Stáhněte si `OSMgen.atbx` a `OSMgen.py`.
 2. V ArcGIS Pro klikněte pravým tlačítkem na **Toolboxes** -> **Add Toolbox** a připojte stažený `.atbx` soubor.
 3. Spusťte nástroj, vložte surové OSM linie, zadejte cílové měřítko (např. 100000), název zájmové řeky a cílový souřadnicový systém.
 
 ---
-**Autor:** [Tvé Jméno]  
+**Autor:** Adam Sojka 
 **Licence:** Nástroj je k dispozici open-source pro analytické a akademické účely.

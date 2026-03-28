@@ -31,7 +31,7 @@ Geoprocessingový nástroj pro ArcGIS Pro vyvinutý v rámci bakalářské prác
 ## Řešený problém
 Crowdsourcovaná data (VGI) z OSM obsahují množství chyb: chybějící uzly na křižovatkách, umělé kanály přerušující hlavní tok, oddělená ramena ostrovů a mikroskopické mezery. Standardní plošné ořezy a jednoduché trasovací GIS nástroje na těchto datech většinou selhávají nebo ničí celistvost povodí.
 
-## Jak to funguje pod kapotou
+## Jak to funguje
 Skript opouští jednoduché geometrické trasování a spoléhá na teorii grafů a heuristiku:
 * **Tuple-Based Scout (Pathfinding):** Na každé bifurkaci se algoritmus podívá až 100 segmentů dopředu. Trasování hodnotí přes n-tice (přesná shoda jména > částečná shoda > typ toku > délka), aby hlavní řeka neuhnula do bezejmenného náhonu.
 * **Topologický magnet (1,5 m):** Namísto exaktního geometrického průniku skript spojuje uzly s mírnou tolerancí. Přemosťuje tak mikromezery vzniklé špatnou digitalizací nebo projekčními posuny.

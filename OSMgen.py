@@ -1,89 +1,95 @@
 # -*- coding: utf-8 -*-
 """
-BAKALÁŘKA 2026: HYBRIDNÍ TOPOLOGICKÝ MODEL ŘÍČNÍ SÍTĚ (BULLETPROOF)
-=====================================================
-- STRIKTNĚ ORIENTOVANÝ GRAF: Zabraňuje toku proti proudu.
-- SCOUT ALGORITMUS: Hledá hlavní větve (Jméno -> Fclass -> Délka).
-- RYCHLÝ KAHN: O(1) Cycle Breaker.
-- INK PROPAGATION 85/15: Vizuální barvení ostrovů (Nerozbíjí topologii!).
-- KARTOGRAFICKÝ INDEX: sqrt(Shreve * Upstream_Length).
-- PSEUDO-PROPORTIONAL SYMBOLOGY: 100 tříd (0.1 - 7.0 pt).
+OSMgen: Nástroj pro hybridní topologický model a generalizaci říční sítě
+========================================================================
+Nástroj vyvinutý pro extrakci, topologickou analýzu a kartografickou 
+generalizaci říčních sítí ze surových dat OpenStreetMap (OSM).
+Model je optimalizován pro přehledná mapová měřítka.
+
+Klíčové algoritmy:
+- Tuple-Based Scout (Rozhodování na bifurkacích)
+- Kahnův topologický algoritmus (Třídění pro akumulaci)
+- Zpětná propagace (Ochrana proti pahýlům a ztrátě pramenů)
+- BFS Ink Propagation (Záchrana paralelních ramen a ostrovů)
+- Pairwise Buffer (Rychlé generování plošného koryta)
 """
 
 import arcpy
 import math
 import os
 import unicodedata
+import sys
 from collections import defaultdict, deque
 from datetime import datetime
 
 # =========================================================
-# POMOCNÉ FUNKCE
+# 1. POMOCNÉ FUNKCE A TEXTOVÁ NORMALIZACE
 # =========================================================
+
 def log(msg):
+    """Zápis zpráv do konzole ArcGIS a standardního výstupu."""
     arcpy.AddMessage(msg)
     print(msg)
 
 def normalize_name(name):
+    """
+    Odstraní diakritiku a převede text na malá písmena.
+    Zajišťuje bezpečné a jednotné porovnávání textových atributů.
+    """
     if not name: return ""
     return "".join(c for c in unicodedata.normalize('NFD', str(name).lower()) if unicodedata.category(c) != 'Mn').strip()
 
 def get_name_words(name):
+    """
+    Rozloží název na množinu jednotlivých slov pro částečné shody 
+    (např. 'Černá Ostravice' -> {'cerna', 'ostravice'}).
+    """
     norm = normalize_name(name)
     return set(norm.replace('-', ' ').replace(',', ' ').split()) if norm else set()
 
-def calc_deviation(naj, geom_out):
-    if not geom_in or not geom_out: return 90.0 
+def scout_branch(source_oid, target_oid, river_data, downstream_targets, target_name_words, max_depth=8):
+    """
+    Heuristický algoritmus prohledávání (Lookahead).
+    Hodnotí vhodnost cesty na soutocích nahlížením až o `max_depth` segmentů vpřed.
+    Vrací multikriteriální skóre (Tuple), kde má prioritu shoda názvu nad délkou.
+    """
+    paths = []
+    stack = [[target_oid]]
     
-    dx1 = geom_in['last'][0] - geom_in['first'][0]
-    dy1 = geom_in['last'][1] - geom_in['first'][1]
-    dx2 = geom_out['last'][0] - geom_out['first'][0]
-    dy2 = geom_out['last'][1] - geom_out['first'][1]
-    
-    mag1 = math.hypot(dx1, dy1)
-    mag2 = math.hypot(dx2, dy2)
-    
-    if mag1 == 0 or mag2 == 0: return 90.0 
-    
-    cos_val = (dx1 * dx2 + dy1 * dy2) / (mag1 * mag2)
-    cos_val = max(-1.0, min(1.0, cos_val))
-    return math.degrees(math.acos(cos_val))
-
-def scout_branch(source_oid, target_oid, river_data, downstream_targets, max_depth=5):
-    score = 0
-    current = target_oid
-    src_norm = river_data[source_oid]["norm"]
-    src_fclass = river_data[source_oid]["fclass"]
-    
-    dev = calc_deviation(river_data[source_oid], river_data[target_oid])
-    if dev > 30:
-        score -= (dev * 2) 
-    
-    for _ in range(max_depth):
-        if current not in river_data: break 
+    # Průchod grafem do definované hloubky
+    while stack:
+        path = stack.pop()
+        curr = path[-1]
         
-        curr_data = river_data[current]
-        score += curr_data["len"]
+        if len(path) == max_depth:
+            paths.append(path)
+            continue
+            
+        nxt_opts = [t for t in downstream_targets.get(curr, []) if t in river_data and t not in path]
+        if not nxt_opts:
+            paths.append(path)
+        else:
+            for n in nxt_opts:
+                stack.append(path + [n])
+                
+    best_score = (-1, -1, -1, -1) 
+    
+    # Vyhodnocení nalezených tras
+    for path in paths:
+        exact_names = sum(1 for n in path if target_name_words and river_data[n]["words"] == target_name_words)
+        partial_names = sum(1 for n in path if target_name_words and river_data[n]["words"].intersection(target_name_words))
+        rivers = sum(1 for n in path if river_data[n]["fclass"] == 'river')
+        total_len = sum(river_data[n]["len"] for n in path)
         
-        if src_norm and curr_data["norm"] == src_norm:
-            score += 10000  
+        # Tuple skórování: Python automaticky hodnotí prioritu zleva doprava
+        score = (exact_names, partial_names, rivers, total_len)
+        if score > best_score:
+            best_score = score
             
-        if src_fclass and curr_data["fclass"] == src_fclass:
-            score += 5000
-            
-        nxt_opts = [t for t in downstream_targets.get(current, []) if t in river_data]
-        if not nxt_opts: 
-            break 
-            
-        current = max(nxt_opts, key=lambda t: (
-            src_norm != "" and river_data[t]["norm"] == src_norm,
-            src_fclass != "" and river_data[t]["fclass"] == src_fclass,
-            river_data[t]["len"]
-        ))
-            
-    return score
+    return best_score
 
 def get_param(index, default_value):
+    """Bezpečné načtení parametrů z GUI nástroje ArcGIS."""
     try:
         val = arcpy.GetParameterAsText(index)
         if not val: return default_value
@@ -94,89 +100,143 @@ def get_param(index, default_value):
         return default_value
 
 # ==============================================================
-# PARAMETRY A PROSTŘEDÍ
+# 2. INICIALIZACE PARAMETRŮ A PRACOVNÍHO PROSTŘEDÍ
 # ==============================================================
+
 SRC_LINES       = arcpy.GetParameterAsText(0) or r"C:\Users\adams\Documents\BP_project_GIS\DATA IN\gis_osm_waterways_free_1.shp"
-OUT_FOLDER      = arcpy.GetParameterAsText(1) or r"C:\Users\adams\Documents\BP_project_GIS\DATA"
-TARGET_SCALE    = get_param(2, 100000.0)
+TARGET_SCALE    = get_param(1, 100000.0)
+MAIN_RIVER_NAME = arcpy.GetParameterAsText(2)
+OSM_ID_INPUT    = arcpy.GetParameterAsText(3)
+OUT_GDB         = arcpy.GetParameterAsText(4) 
+BASE_RADIUS     = get_param(5, 0.32) 
 
-MAIN_RIVER_NAME = arcpy.GetParameterAsText(4) or "Morava"
-main_river_words = get_name_words(MAIN_RIVER_NAME.replace(',', ' '))
+# Načtení cílového souřadnicového systému (jako prostorového objektu)
+try:
+    OUT_SR = arcpy.GetParameter(6)
+except:
+    OUT_SR = None
 
-cutoff_raw      = arcpy.GetParameterAsText(6) or "umělý kanál, přivaděč, náhon, kanál"
-CUTOFF_NAMES    = [w for n in cutoff_raw.split(',') for w in get_name_words(n)] if cutoff_raw else ["kanal", "privadec", "nahon"]
+ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+raw_name = normalize_name(MAIN_RIVER_NAME)
+safe_river = "".join(c if c.isalnum() else "_" for c in raw_name).strip("_").capitalize() if raw_name else "Reka"
+
+# Priorita názvu výstupů podle zadaných parametrů
+if OSM_ID_INPUT: safe_river = f"OSM_{str(OSM_ID_INPUT).strip()}"
+
+# Zajištění výstupní geodatabáze
+if OUT_GDB and os.path.exists(OUT_GDB):
+    gdb_path = OUT_GDB
+else:
+    current_ws = arcpy.env.workspace
+    if current_ws and current_ws.lower().endswith('.gdb'): 
+        OUT_FOLDER = os.path.dirname(current_ws)
+    else: 
+        OUT_FOLDER = current_ws if current_ws else arcpy.env.scratchFolder
+
+    if not os.path.exists(OUT_FOLDER):
+        try: os.makedirs(OUT_FOLDER)
+        except: pass
+    
+    gdb_name = f"Povodi_{safe_river}_{ts}"
+    gdb_path = os.path.join(OUT_FOLDER, f"{gdb_name}.gdb")
+    arcpy.management.CreateFileGDB(OUT_FOLDER, gdb_name)
+
+arcpy.env.workspace = gdb_path
+
+# Definiční knihovny pro sémantickou analýzu
+cutoff_raw       = "umělý kanál, přivaděč, náhon, kanál"
+CUTOFF_NAMES     = [w for n in cutoff_raw.split(',') for w in get_name_words(n)]
+WATERBODY_KW     = {"nadrz", "rybnik", "jezero", "prehrada", "tajch", "ryb.", "vodni"}
 SUSPICIOUS_LIMIT = 50000.0 
-
-TARGET_WKID     = 5514
-NAME_FIELD      = "name"
+NAME_FIELD       = "name"
 
 arcpy.env.overwriteOutput = True
 arcpy.env.parallelProcessingFactor = "100%"
 
-if not os.path.exists(OUT_FOLDER):
-    os.makedirs(OUT_FOLDER)
-
-ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-safe_river = list(main_river_words)[0].capitalize() if main_river_words else "Reka"
-gdb_path = os.path.join(OUT_FOLDER, f"Povodi_{safe_river}_{ts}.gdb")
-arcpy.management.CreateFileGDB(OUT_FOLDER, f"Povodi_{safe_river}_{ts}.gdb")
-arcpy.env.workspace = gdb_path
-
-log(f"=== SPUŠTĚNO PRO MĚŘÍTKO 1:{int(TARGET_SCALE)} (Povodí: {MAIN_RIVER_NAME}) ===")
+log(f"=== OSMgen: SPUŠTĚNO PRO CÍLOVÉ MĚŘÍTKO 1:{int(TARGET_SCALE)} ===")
+log(f"=== VÝSTUPNÍ GEODATABÁZE: {gdb_path} ===")
 
 # =========================================================
-# FÁZE A: PERFEKTNÍ SEGMENTACE (SOUTOKY)
+# FÁZE A: GEOMETRICKÁ DEKOMPOZICE A PROJEKCE
 # =========================================================
-log("\n[FÁZE A] Projekce a planární rozbití (Feature To Line)...")
-lines_proj = os.path.join(gdb_path, "L01_Projected")
-arcpy.management.Project(SRC_LINES, lines_proj, arcpy.SpatialReference(TARGET_WKID))
 
-lines_fc = os.path.join(gdb_path, "L02_Planarized")
-arcpy.management.FeatureToLine(lines_proj, lines_fc, attributes="ATTRIBUTES")
+log(f"\n[FÁZE A] 1) Geometrická dekompozice linií na soutocích...")
+temp_planar_name = arcpy.ValidateTableName(f"L01_Planarized_{ts}", gdb_path)
+temp_planar = os.path.join(gdb_path, temp_planar_name)
+
+# Rozdělení multipart prvků a vynucení topologických uzlů (ještě v původní projekci)
+arcpy.management.FeatureToLine(SRC_LINES, temp_planar, attributes="ATTRIBUTES")
+
+log(f"[FÁZE A] 2) Transformace do metrického souřadnicového systému...")
+input_desc = arcpy.Describe(temp_planar)
+spatial_ref = input_desc.spatialReference
+
+# Ošetření nezadaného systému (fallback na národní systém S-JTSK)
+if OUT_SR and getattr(OUT_SR, 'name', None):
+    target_sr = OUT_SR
+else:
+    target_sr = arcpy.SpatialReference(5514) 
+
+lines_fc_name = arcpy.ValidateTableName(f"L02_WorkingLines_{ts}", gdb_path)
+lines_fc = os.path.join(gdb_path, lines_fc_name)
+
+if spatial_ref.factoryCode != target_sr.factoryCode:
+    log(f"  -> Aplikuji transformaci z {spatial_ref.name} do {target_sr.name}...")
+    arcpy.management.Project(temp_planar, lines_fc, target_sr)
+else:
+    arcpy.management.CopyFeatures(temp_planar, lines_fc)
+
+arcpy.management.Delete(temp_planar)
 
 # =========================================================
-# FÁZE B: STRIKTNĚ ORIENTOVANÝ GRAF A "SCOUT"
-# =========================================================
-log(f"\n[FÁZE B] 1) Extrakce geometrie a budování jednosměrného grafu (Konec -> Začátek)...")
-temp_end_pts = os.path.join(gdb_path, "temp_end_pts")
-arcpy.management.FeatureVerticesToPoints(lines_fc, temp_end_pts, "END")
+# FÁZE B: EXTRAKCE TOPOLOGIE A TRASOVÁNÍ GRAFU
+# ========================================================= 
 
-temp_start_pts = os.path.join(gdb_path, "temp_start_pts")
-arcpy.management.FeatureVerticesToPoints(lines_fc, temp_start_pts, "START")
+log(f"\n[FÁZE B] 1) Budování struktur orientovaného grafu (DAG)...")
+end_pts_name = arcpy.ValidateTableName(f"temp_end_{ts}", gdb_path)
+start_pts_name = arcpy.ValidateTableName(f"temp_start_{ts}", gdb_path)
+temp_end = os.path.join(gdb_path, end_pts_name)
+temp_start = os.path.join(gdb_path, start_pts_name)
 
-temp_near = os.path.join(gdb_path, "temp_near_directed")
-arcpy.analysis.GenerateNearTable(temp_end_pts, temp_start_pts, temp_near, "0.1 Meters", closest="ALL")
+# Extrakce koncových bodů pro definici směru proudění
+arcpy.management.FeatureVerticesToPoints(lines_fc, temp_end, "END")
+arcpy.management.FeatureVerticesToPoints(lines_fc, temp_start, "START")
 
-endpt_to_seg = {pt: orig for pt, orig in arcpy.da.SearchCursor(temp_end_pts, ["OID@", "ORIG_FID"])}
-startpt_to_seg = {pt: orig for pt, orig in arcpy.da.SearchCursor(temp_start_pts, ["OID@", "ORIG_FID"])}
+near_name = arcpy.ValidateTableName(f"temp_near_{ts}", gdb_path)
+temp_near = os.path.join(gdb_path, near_name)
 
+# Topologický magnet: Zvýšená tolerance (1.5 m) přemosťuje drobné datové chyby (mikromezery)
+arcpy.analysis.GenerateNearTable(temp_end, temp_start, temp_near, "1.5 Meters", closest="ALL")
+
+endpt_to_seg = {r[0]: r[1] for r in arcpy.da.SearchCursor(temp_end, ["OID@", "ORIG_FID"])}
+startpt_to_seg = {r[0]: r[1] for r in arcpy.da.SearchCursor(temp_start, ["OID@", "ORIG_FID"])}
+
+# Načtení atributů sítě do paměti
 river_data = {}
+fields_in_fc = [f.name for f in arcpy.ListFields(lines_fc)]
 valid_class_fields = ['fclass', 'waterway', 'type', 'class']
-class_field = next((f.name for f in arcpy.ListFields(lines_fc) if f.name.lower() in valid_class_fields), None)
+class_field = next((f for f in fields_in_fc if f.lower() in valid_class_fields), None)
+osm_id_field = next((f for f in fields_in_fc if f.lower() == 'osm_id'), None)
 
 search_fields = ["OID@", NAME_FIELD, "SHAPE@LENGTH", "SHAPE@"]
-if class_field:
-    search_fields.insert(2, class_field)
+if class_field: search_fields.append(class_field)
+if osm_id_field: search_fields.append(osm_id_field)
 
 with arcpy.da.SearchCursor(lines_fc, search_fields) as cur:
     for row in cur:
-        oid, nm = row[0], row[1]
-        fcls = str(row[2]).lower() if class_field and row[2] else ""
-        length = row[3] if class_field else row[2]
-        geom = row[4] if class_field else row[3]
-        first_pt = geom.firstPoint if geom else None
-        last_pt = geom.lastPoint if geom else None
+        oid, nm, length, geom = row[0], row[1], row[2], row[3]
+        fcls = str(row[search_fields.index(class_field)]).lower() if class_field else ""
+        row_osm_id = str(row[search_fields.index(osm_id_field)]) if osm_id_field and row[search_fields.index(osm_id_field)] else ""
         
         river_data[oid] = {
             "name": nm if nm else "", "norm": normalize_name(nm), "words": get_name_words(nm), 
-            "fclass": fcls, "len": length,
-            "first": (first_pt.X, first_pt.Y) if first_pt else (0,0),
-            "last": (last_pt.X, last_pt.Y) if last_pt else (0,0)
+            "fclass": fcls, "len": length, "osm_id": row_osm_id
         }
 
 downstream_targets = defaultdict(list)
 upstream_sources = defaultdict(list)
 
+# Sestavení paměťových seznamů sousednosti (Adjacency Lists)
 with arcpy.da.SearchCursor(temp_near, ["IN_FID", "NEAR_FID"]) as cur:
     for pt_end, pt_start in cur:
         source_seg = endpt_to_seg.get(pt_end)
@@ -186,208 +246,321 @@ with arcpy.da.SearchCursor(temp_near, ["IN_FID", "NEAR_FID"]) as cur:
                 downstream_targets[source_seg].append(target_seg)
                 upstream_sources[target_seg].append(source_seg)
 
+log("\n[FÁZE B] 2) Definice zájmového toku a lokalizace kořenového uzlu...")
+start_node = None
+target_name_words = set()
+
+# Primární pokus: Vyhledání podle OSM ID
+if OSM_ID_INPUT:
+    candidates = [oid for oid, d in river_data.items() if d["osm_id"] == str(OSM_ID_INPUT).strip()]
+    if candidates:
+        start_node = max(candidates, key=lambda x: river_data[x]["len"])
+        target_name_words = river_data[start_node]["words"]
+        log(f"  -> Uzel inicializován na základě OSM ID ({OSM_ID_INPUT}).")
+
+# Sekundární pokus: Vyhledání podle textového názvu toku
+if not start_node and MAIN_RIVER_NAME:
+    main_river_words = get_name_words(MAIN_RIVER_NAME.replace(',', ' '))
+    candidates = [oid for oid, d in river_data.items() if d["words"].intersection(main_river_words)]
+    if candidates:
+        start_node = max(candidates, key=lambda x: river_data[x]["len"])
+        target_name_words = main_river_words
+        log(f"  -> Uzel inicializován na základě sémantické shody.")
+
+if not start_node:
+    arcpy.AddError("Kritická chyba: Počáteční segment nebyl v datech nalezen.")
+    sys.exit()
+
+log("\n[FÁZE B] 3) Evaluace bifurkací (Scout Algoritmus)...")
 primary_downstream = {}
 primary_upstream = defaultdict(list)
 
-log("[FÁZE B] 2) Výběr hlavních ramen (Scout: Jméno + Typ toku + Délka)...")
+# Stanovení primární větve na každém větvení
 for source, targets in downstream_targets.items():
-    valid_targets = [t for t in targets if t in river_data and river_data[t]["len"] > 5.0]
-    if not valid_targets: valid_targets = [t for t in targets if t in river_data]
+    valid_targets = [t for t in targets if t in river_data]
     if not valid_targets: continue
-        
-    if len(valid_targets) == 1:
-        best_target = valid_targets[0]
-    else:
-        scores = {t: scout_branch(source, t, river_data, downstream_targets) for t in valid_targets}
-        best_target = max(scores, key=scores.get)
     
+    best_target = max(valid_targets, key=lambda t: scout_branch(source, t, river_data, downstream_targets, target_name_words, max_depth=8))
     primary_downstream[source] = best_target
     primary_upstream[best_target].append(source)
 
-log(f"[FÁZE B] 3) Izolace povodí '{MAIN_RIVER_NAME}' (Tvoje původní stabilní metoda)...")
-main_segs = [oid for oid, d in river_data.items() if d["words"].intersection(main_river_words)]
-if not main_segs: raise ValueError(f"Řeka {MAIN_RIVER_NAME} nenalezena v datech!")
-
-main_segs_set = set(main_segs)
-start_node = max(main_segs, key=lambda oid: river_data[oid]["len"])
-
+log("\n[FÁZE B] 4) Detekce ústí a vymezení hydrologického povodí (DFS)...")
 curr = start_node
-visited = set([curr])
+visited_down = set([curr])
+
+# Walk-down fáze: Trasování k ústí řeky
 while True:
     nxt = primary_downstream.get(curr)
-    if not nxt or nxt not in main_segs_set or nxt in visited:
-        break
-    visited.add(nxt)
+    if not nxt or nxt in visited_down: break
+    curr_words = river_data[curr]["words"]
+    nxt_words = river_data[nxt]["words"]
+    other_tributaries = [t for t in upstream_sources[nxt] if t != curr]
+    is_demise = False
+    
+    # Detekce zániku toku s ohledem na říční ostrovy a paralelní ramena
+    if nxt_words:
+        we_continue = bool(curr_words.intersection(nxt_words))
+        for t in other_tributaries:
+            if bool(river_data[t]["words"].intersection(nxt_words)) and not we_continue:
+                is_demise = True; break
+                
+    if not is_demise and target_name_words and nxt_words:
+        if not target_name_words.intersection(nxt_words) and not WATERBODY_KW.intersection(nxt_words): is_demise = True
+
+    if is_demise: break
+    visited_down.add(nxt)
     curr = nxt
     
 outlet_oid = curr
+
+# DFS fáze: Sběr všech nadřazených větví (izolace povodí)
 stack = [outlet_oid]
 basin_nodes = set([outlet_oid])
-
 while stack:
     curr = stack.pop()
-    for c in upstream_sources[curr]:
+    for c in primary_upstream[curr]:
         if c not in basin_nodes:
-            basin_nodes.add(c)
-            stack.append(c)
+            basin_nodes.add(c); stack.append(c)
 
 # =========================================================
-# FÁZE C: TOPOLOGICKÉ ŘAZENÍ A AKUMULACE
+# FÁZE C: VÝPOČET HYDROMETRIK A OCHRANNÝCH FILTRŮ
 # =========================================================
-log("\n[FÁZE C] 1) Rychlé Kahnův řazení (O(1) Cycle Breaker)...")
 
-for field in ["upstr_len", "render_val", "filter_val"]:
-    arcpy.management.AddField(lines_fc, field, "DOUBLE")
-for field in ["shreve_val", "strahler_val"]:
-    arcpy.management.AddField(lines_fc, field, "LONG")
+log("\n[FÁZE C] 1) Topologické třídění sítě (Kahnův algoritmus)...")
+for field in ["upstr_len", "shreve_proxy", "max_ds_shreve", "filter_val"]: arcpy.management.AddField(lines_fc, field, "DOUBLE")
+for field in ["shreve_val", "strahler_val"]: arcpy.management.AddField(lines_fc, field, "LONG")
+arcpy.management.AddField(lines_fc, "is_basin", "SHORT")
 
 in_degree = {n: 0 for n in basin_nodes}
 for n in basin_nodes:
     for c in primary_upstream[n]:
         if c in basin_nodes: in_degree[n] += 1
 
+# Řazení uzlů od pramenů k ústí
 queue = deque([n for n in basin_nodes if in_degree[n] == 0])
-topo_order = []
-remaining = set(basin_nodes)
+topo_order, remaining = [], set(basin_nodes)
 
 while remaining:
     if not queue:
         forced_node = next(iter(remaining))
-        in_degree[forced_node] = 0
-        queue.append(forced_node)
+        in_degree[forced_node] = 0; queue.append(forced_node)
         
     curr = queue.popleft()
     if curr not in remaining: continue
-        
-    remaining.remove(curr)
-    topo_order.append(curr)
+    remaining.remove(curr); topo_order.append(curr)
         
     target = primary_downstream.get(curr)
     if target and target in remaining:
         in_degree[target] -= 1
-        if in_degree[target] == 0:
-            queue.append(target)
+        if in_degree[target] == 0: queue.append(target)
 
-log("[FÁZE C] 2) Matematická akumulace v kostře (Domino efekt)...")
+log("[FÁZE C] 2) Výpočet Strahlerova a Shreveho řádu toku...")
 upstr_len, shreve_vals, strahler_vals = {}, {}, {}
-oid_syms, oid_filters = {}, {}
-
-# Agresivní prahy pro kartografický filtr
-LEN_THRESHOLD = TARGET_SCALE * 0.08
-SHR_THRESHOLD = max(1.0, TARGET_SCALE / 5000.0)
 
 for node in topo_order:
     primary_children = [c for c in primary_upstream[node] if c in basin_nodes and c in upstr_len]
-    
     if not primary_children:
         upstr_len[node], shreve_vals[node], strahler_vals[node] = river_data[node]["len"], 1, 1
     else:
         upstr_len[node] = river_data[node]["len"] + sum(upstr_len[c] for c in primary_children)
         shreve_vals[node] = sum(shreve_vals[c] for c in primary_children)
-        
         c_str = [strahler_vals[c] for c in primary_children]
         max_s = max(c_str)
         strahler_vals[node] = max_s + 1 if c_str.count(max_s) >= 2 else max_s
 
-    l_val, sh_val, st_val = upstr_len[node], shreve_vals[node], strahler_vals[node]
-    
-    # NOVÝ VZOREC: sqrt(Shreve * Upstream Length)
-    render_val = math.sqrt(max(1.0, sh_val) * max(1.0, l_val))
-    
-    # Filtrace: 1.0 (Ponechat) / 0.0 (Smazat)
-    is_main = bool(river_data[node]["words"].intersection(main_river_words))
-    f_val = 1.0 if (is_main or l_val >= LEN_THRESHOLD or sh_val >= SHR_THRESHOLD) else 0.0
-    
-    is_canal = any(c in river_data[node]["words"] for c in CUTOFF_NAMES)
-    if is_canal and l_val > SUSPICIOUS_LIMIT:
-        render_val, f_val = 0.0, 0.0
+log("[FÁZE C] 3) Ochrana pramenů: Zpětná propagace (Inherited Shreve a Length)...")
+max_ds_shreve = {}
+max_ds_len = {} # Ochrana před pahýly
+main_trunk_nodes = set([outlet_oid]) 
 
-    oid_syms[node], oid_filters[node] = render_val, f_val
+for node in reversed(topo_order):
+    if node not in max_ds_shreve:
+        max_ds_shreve[node] = shreve_vals[node]
+    if node not in max_ds_len:
+        max_ds_len[node] = upstr_len[node]
+        
+    primary_children = [c for c in primary_upstream[node] if c in basin_nodes and c in upstr_len]
+    if primary_children:
+        # Volba hlavní větve pro propagaci štítu
+        main_child = max(primary_children, key=lambda c: (
+            bool(target_name_words and river_data[c]["words"].intersection(target_name_words)),
+            shreve_vals[c], 
+            upstr_len[c]
+        ))
+        
+        for c in primary_children:
+            # Hlavní dítě dědí hodnoty zespodu, vedlejší děti začínají vlastní akumulaci
+            max_ds_shreve[c] = max_ds_shreve[node] if c == main_child else shreve_vals[c]
+            max_ds_len[c] = max_ds_len[node] if c == main_child else upstr_len[c]
+            
+            if node in main_trunk_nodes and c == main_child:
+                main_trunk_nodes.add(c)
 
-log("[FÁZE C] 3) Vizuální záchrana ostrovů (Nová multiplikační Ink Propagation)...")
-ink_queue = deque()
+log("[FÁZE C] 4) Inicializace sémantického štítu a délkových filtrů...")
+oid_proxy, oid_filters = {}, {}
+
+# Vyloučení generických slov (aby každý "potok" nedostal imunitu proti smazání)
+generic_words = {"potok", "reka", "r.", "p.", "kanal", "nadrz", "vodni"}
+specific_name_words = target_name_words - generic_words
+if not specific_name_words: specific_name_words = target_name_words
+
+# Exponenciální prahy pro čistší malá měřítka
+LEN_THRESHOLD = TARGET_SCALE * 0.12  
+SHR_THRESHOLD = max(1.0, (TARGET_SCALE / 20000.0) ** 2) 
 
 for node in topo_order:
-    alfa_target = primary_downstream.get(node)
-    all_targets = [t for t in downstream_targets.get(node, []) if t in basin_nodes]
+    l_val = upstr_len[node]
+    sh_val = shreve_vals[node]
+    inherited_shreve = max_ds_shreve.get(node, sh_val)
+    inherited_len = max_ds_len.get(node, l_val) # TADY JE TA MAGIE PROTI PAHÝLŮM
+    is_true_main = (node in main_trunk_nodes)
     
-    for t in all_targets:
-        if t != alfa_target:
-            # Vedlejší rameno dostane 15 % hodnoty vizuální mohutnosti uzlu nad ním
-            side_multiplier = 0.15 / max(1, len(all_targets) - 1)
-            pass_sym = oid_syms.get(node, 0) * side_multiplier
-            pass_flt = oid_filters.get(node, 0)
-            ink_queue.append((t, pass_sym, pass_flt))
+    shreve_proxy = math.sqrt(max(1.0, sh_val))
+    
+    if is_true_main:
+        f_val = 1.0 
+    else:
+        # Hodnotíme CELÝ tok pomocí inherited_len, neřežeme ho na kousky!
+        f_val = 1.0 if (inherited_len >= LEN_THRESHOLD or inherited_shreve >= SHR_THRESHOLD) else 0.0
+        
+        # Eliminace umělých kanálů
+        if any(c in river_data[node]["words"] for c in CUTOFF_NAMES) and l_val > SUSPICIOUS_LIMIT:
+            shreve_proxy, f_val = 0.0, 0.0
+
+    oid_proxy[node], oid_filters[node] = shreve_proxy, f_val
+
+# Zajištění imunity pro Topologickou páteř (na základě specifických jmen)
+backbone = set()
+if target_name_words:
+    curr = outlet_oid
+    backbone.add(curr)
+    while curr:
+        parents = [p for p in primary_upstream.get(curr, []) if p in basin_nodes]
+        if not parents: break
+        best_p = max(parents, key=lambda p: (bool(river_data[p]["words"].intersection(specific_name_words)), river_data[p]["len"]))
+        backbone.add(best_p)
+        curr = best_p
+        
+    for node in basin_nodes:
+        is_same_river = bool(river_data[node]["words"].intersection(specific_name_words))
+        if node in backbone or is_same_river:
+            oid_filters[node] = 1.0
+
+log("[FÁZE C] 5) Ochrana ostrovů: Prohledávání do šířky (Ink Propagation)...")
+ink_queue = deque()
+for node in topo_order:
+    alfa_tgt = primary_downstream.get(node)
+    for t in [tgt for tgt in downstream_targets.get(node, []) if tgt in basin_nodes]:
+        if t != alfa_tgt:
+            # Propustí část vizuální váhy do vedlejších ramen ostrovů
+            is_named_branch = bool(specific_name_words and river_data[t]["words"].intersection(specific_name_words))
+            multiplier = 0.85 if is_named_branch else 0.15
+            ink_queue.append((t, oid_proxy.get(node, 0) * multiplier, oid_filters.get(node, 0)))
 
 while ink_queue:
-    curr, sym, flt = ink_queue.popleft()
+    curr, proxy, flt = ink_queue.popleft()
     
-    if sym > oid_syms.get(curr, -1):
-        oid_syms[curr] = sym
-        oid_filters[curr] = max(flt, oid_filters.get(curr, 0))
+    # Ochrana proti přepsání hlavní páteře špatnou šířkou z ostrova
+    is_true_main = (curr in main_trunk_nodes)
+    
+    if not is_true_main:
+        updated = False
         
-        for t in downstream_targets.get(curr, []):
-            if t in basin_nodes:
-                ink_queue.append((t, sym, flt))
+        # 1. Nezávislé šíření imunity (Filtru) - ZACHRÁNÍ OSTROV PŘED SMAZÁNÍM
+        if flt > oid_filters.get(curr, 0):
+            oid_filters[curr] = flt
+            updated = True
+            
+        # 2. Nezávislé šíření vizuální šířky (Proxy) - UDĚLÁ OSTROV UŽŠÍ NEŽ HLAVNÍ TOK
+        if proxy > oid_proxy.get(curr, -1):
+            oid_proxy[curr] = proxy
+            updated = True
+            
+        if updated:
+            for t in [tgt for tgt in downstream_targets.get(curr, []) if tgt in basin_nodes]:
+                ink_queue.append((t, proxy, flt)) 
 
-log("  -> Zápis dat do tabulky atributů...")
-with arcpy.da.UpdateCursor(lines_fc, ["OID@", "upstr_len", "shreve_val", "strahler_val", "render_val", "filter_val"]) as cur:
+log("[FÁZE C] 6) Zápis vypočtených metrik do atributové tabulky (DEBUG vrstva)...")
+with arcpy.da.UpdateCursor(lines_fc, ["OID@", "upstr_len", "shreve_val", "strahler_val", "shreve_proxy", "max_ds_shreve", "filter_val", "is_basin"]) as cur:
     for row in cur:
         oid = row[0]
         if oid in basin_nodes:
             row[1], row[2], row[3] = upstr_len.get(oid, 0), shreve_vals.get(oid, 0), strahler_vals.get(oid, 0)
-            row[4], row[5] = oid_syms.get(oid, 0), oid_filters.get(oid, 0)
+            row[4], row[5], row[6] = oid_proxy.get(oid, 0), max_ds_shreve.get(oid, 0), oid_filters.get(oid, 0)
+            row[7] = 1 
             cur.updateRow(row)
         else:
-            cur.deleteRow()
+            row[1], row[2], row[3], row[4], row[5], row[6], row[7] = 0, 0, 0, 0.0, 0, 0.0, 0
+            cur.updateRow(row)
+
+debug_name = arcpy.ValidateTableName(f"DEBUG_Sit_{safe_river}_{ts}", gdb_path)
+debug_fc = os.path.join(gdb_path, debug_name)
+arcpy.management.CopyFeatures(lines_fc, debug_fc)
 
 # =========================================================
-# FÁZE D: DYNAMICKÝ VÝBĚR (AGRESIVNÍ OŘEZ)
+# FÁZE D: KARTOGRAFICKÁ GENERALIZACE A 2D KORYTO
 # =========================================================
-log(f"\n[FÁZE D] Ořez sítě pro měřítko 1:{int(TARGET_SCALE)}...")
-final_carto_fc = os.path.join(gdb_path, f"Povodi_{safe_river}_{int(TARGET_SCALE)}")
 
-arcpy.analysis.Select(lines_fc, final_carto_fc, "filter_val >= 0.5")
+log(f"\n[FÁZE D] Datová redukce a generování polygonů (Cílové měřítko 1:{int(TARGET_SCALE)})...")
 
+sel_name = arcpy.ValidateTableName(f"Temp_Selected_{ts}", gdb_path)
+temp_selected_fc = os.path.join(gdb_path, sel_name)
+# Odstranění segmentů, které nesplnily podmínky ochrany
+arcpy.analysis.Select(lines_fc, temp_selected_fc, "filter_val >= 0.5")
+
+dp_tol = max(10, int(TARGET_SCALE / 2000)) 
+log(f"  -> Krok 1: Redukce lomových bodů (Douglas-Peucker alg., tolerance: {dp_tol} m)")
+simp_name = arcpy.ValidateTableName(f"Temp_Simplified_{ts}", gdb_path)
+temp_simplified_fc = os.path.join(gdb_path, simp_name)
+arcpy.cartography.SimplifyLine(temp_selected_fc, temp_simplified_fc, "BEND_SIMPLIFY", f"{dp_tol} Meters", "RESOLVE_ERRORS", "KEEP_COLLAPSED_POINTS")
+
+smooth_tol = max(50, int(TARGET_SCALE / 500)) 
+log(f"  -> Krok 2: Vyhlazení geometrie meandrů (PAEK alg., tolerance: {smooth_tol} m)")
+osa_name = arcpy.ValidateTableName(f"Osa_{safe_river}_{int(TARGET_SCALE)}_{ts}", gdb_path)
+final_carto_fc = os.path.join(gdb_path, osa_name)
+
+# Exaktní zachování pozice krajních bodů (FIXED_CLOSED_ENDPOINT) brání rozpadu sítě
+arcpy.cartography.SmoothLine(
+    in_features=temp_simplified_fc, 
+    out_feature_class=final_carto_fc, 
+    algorithm="PAEK", 
+    tolerance=f"{smooth_tol} Meters", 
+    endpoint_option="FIXED_CLOSED_ENDPOINT", 
+    error_option="RESOLVE_ERRORS"
+)
+
+log("  -> Inicializace matematické definice poloměru koryta (W = k * sqrt(Shreve))...")
+arcpy.management.AddField(final_carto_fc, "buff_dist", "DOUBLE")
+with arcpy.da.UpdateCursor(final_carto_fc, ["shreve_proxy", "buff_dist"]) as cur:
+    for row in cur:
+        row[1] = BASE_RADIUS * row[0] 
+        cur.updateRow(row)
+
+log("  -> Tvorba celistvého 2D polygonu (Turbo Pairwise Buffer)...")
+poly_name = arcpy.ValidateTableName(f"Koryto_Polygon_{safe_river}_{int(TARGET_SCALE)}_{ts}", gdb_path)
+buffer_fc = os.path.join(gdb_path, poly_name)
+
+# Paralelizovaný algoritmus pro masivní úsporu výpočetního času
+arcpy.analysis.PairwiseBuffer(final_carto_fc, buffer_fc, "buff_dist", "ALL")
+
+# Průběžný úklid dočasných vrstev
 try: 
-    for tmp in [temp_end_pts, temp_start_pts, temp_near, lines_proj, lines_fc]:
+    for tmp in [temp_end, temp_start, temp_near, lines_fc, temp_selected_fc, temp_simplified_fc]: 
         arcpy.management.Delete(tmp)
 except: pass
 
-# =========================================================
-# FÁZE E: AUTOMATICKÁ KARTOGRAFIE 
-# =========================================================
+log("\n" + "="*70)
+log(f"  VÝPOČET ÚSPĚŠNĚ DOKONČEN (Souřadnicový systém: {target_sr.name})")
+log(f"  2D Koryto uloženo: {buffer_fc}")
+log(f"  1D Osa uložena: {final_carto_fc}")
+log("="*70)
+
+# Automatické přidání vrstev do aktivní mapy v prostředí ArcGIS Pro
 try:
     aprx = arcpy.mp.ArcGISProject("CURRENT")
     m = aprx.activeMap
-    
-    if m:
-        log("\n[FÁZE E] Vykreslování sítě (Pseudo-Proportional 0.1 - 7.0 pt)...")
-        layer = m.addDataFromPath(final_carto_fc)
-        sym = layer.symbology
-        
-        if hasattr(sym, 'updateRenderer'):
-            sym.updateRenderer('GraduatedSymbolsRenderer')
-            sym.renderer.classificationField = 'render_val'
-            
-            # API Trik: 100 tříd dělá vizuálně dokonalý Proportional efekt
-            sym.renderer.breakCount = 100 
-            
-            sym.renderer.minimumSymbolSize = 0.1 
-            sym.renderer.maximumSymbolSize = 7.0 
-            
-            color = {'RGB': [0, 92, 230, 100]}
-            for brk in sym.renderer.classBreaks:
-                try: brk.symbol.color = color
-                except: pass
-                
-            layer.symbology = sym
-            
-        log(f"✅ Vrstva {layer.name} je připravena v mapě!")
-
-except Exception as e:
-    log(f"  [Info] Symbologii nastav ručně. (Běží mimo GUI: {e})")
-
-log("\n" + "="*70)
-log("ně d VÝPOČET KOMPLETNĚ DOKONČEN!")
-log("="*70)
+    if m: 
+        m.addDataFromPath(buffer_fc)
+        m.addDataFromPath(final_carto_fc)
+        m.addDataFromPath(debug_fc)
+except Exception: pass
